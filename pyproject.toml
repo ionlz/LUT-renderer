@@ -1,0 +1,33 @@
+[project]
+name = "lut-renderer"
+version = "0.1.0"
+description = "Professional video processing tool with LUT support"
+readme = "readme.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [
+  { name = "Ion" }
+]
+dependencies = [
+  "PySide6>=6.6",
+  "qt-material>=2.14",
+  "platformdirs>=4.2",
+  "pyinstaller>=6.19.0",
+  "cython>=3.2.4",
+]
+
+[project.scripts]
+lut-renderer = "lut_renderer.app:main"
+
+[tool.uv]
+package = true
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
