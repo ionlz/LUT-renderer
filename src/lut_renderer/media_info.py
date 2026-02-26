@@ -13,7 +13,10 @@ _FPS_EPSILON = 0.1
 class VideoInfo:
     width: Optional[int] = None
     height: Optional[int] = None
+    sar: Optional[str] = None
+    dar: Optional[str] = None
     bitrate: Optional[str] = None
+    container_bitrate: Optional[str] = None
     fps: Optional[float] = None
     avg_fps: Optional[float] = None
     r_fps: Optional[float] = None
@@ -21,10 +24,26 @@ class VideoInfo:
     duration: Optional[float] = None
     pix_fmt: Optional[str] = None
     bit_depth: Optional[int] = None
+    codec_name: Optional[str] = None
+    codec_long_name: Optional[str] = None
+    profile: Optional[str] = None
+    level: Optional[str] = None
     color_primaries: Optional[str] = None
     color_trc: Optional[str] = None
     colorspace: Optional[str] = None
     color_range: Optional[str] = None
+    format_name: Optional[str] = None
+    format_long_name: Optional[str] = None
+    file_size: Optional[int] = None
+    audio_codec: Optional[str] = None
+    audio_codec_long_name: Optional[str] = None
+    audio_channels: Optional[int] = None
+    audio_channel_layout: Optional[str] = None
+    audio_sample_rate: Optional[int] = None
+    audio_bitrate: Optional[str] = None
+    format_tags: Optional[dict] = None
+    video_tags: Optional[dict] = None
+    audio_tags: Optional[dict] = None
 
     @property
     def resolution(self) -> Optional[str]:
@@ -96,12 +115,10 @@ def probe_video(path: Path) -> VideoInfo:
         "ffprobe",
         "-v",
         "error",
-        "-select_streams",
-        "v:0",
         "-show_entries",
-        "stream=width,height,bit_rate,avg_frame_rate,r_frame_rate,pix_fmt,bits_per_raw_sample,color_primaries,color_transfer,color_space,color_range,duration",
+        "stream=index,codec_type,codec_name,codec_long_name,profile,level,width,height,bit_rate,avg_frame_rate,r_frame_rate,pix_fmt,bits_per_raw_sample,color_primaries,color_transfer,color_space,color_range,duration,sample_aspect_ratio,display_aspect_ratio,channels,channel_layout,sample_rate",
         "-show_entries",
-        "format=bit_rate,duration",
+        "format=bit_rate,duration,size,format_name,format_long_name:format_tags",
         "-of",
         "json",
         str(path),
@@ -109,27 +126,28 @@ def probe_video(path: Path) -> VideoInfo:
     result = subprocess.run(cmd, capture_output=True, text=True, check=True)
     data = json.loads(result.stdout or "{}")
     streams = data.get("streams") or []
-    stream = streams[0] if streams else {}
-    width = stream.get("width")
-    height = stream.get("height")
+    video_stream = next((s for s in streams if s.get("codec_type") == "video"), {})
+    audio_stream = next((s for s in streams if s.get("codec_type") == "audio"), {})
+    width = video_stream.get("width")
+    height = video_stream.get("height")
     fmt = data.get("format") or {}
-    bit_rate = stream.get("bit_rate") or fmt.get("bit_rate")
-    avg_fps = _parse_fraction(stream.get("avg_frame_rate"))
-    r_fps = _parse_fraction(stream.get("r_frame_rate"))
+    bit_rate = video_stream.get("bit_rate") or fmt.get("bit_rate")
+    avg_fps = _parse_fraction(video_stream.get("avg_frame_rate"))
+    r_fps = _parse_fraction(video_stream.get("r_frame_rate"))
     fps = avg_fps or r_fps
     is_vfr = bool(avg_fps and r_fps and abs(avg_fps - r_fps) > _FPS_EPSILON)
-    pix_fmt = stream.get("pix_fmt")
-    bit_depth = _infer_bit_depth(pix_fmt, stream.get("bits_per_raw_sample"))
-    color_primaries = _normalize_color(stream.get("color_primaries"))
-    color_trc = _normalize_color(stream.get("color_trc") or stream.get("color_transfer"))
-    colorspace = _normalize_color(stream.get("colorspace") or stream.get("color_space"))
-    color_range = _normalize_color(stream.get("color_range"))
+    pix_fmt = video_stream.get("pix_fmt")
+    bit_depth = _infer_bit_depth(pix_fmt, video_stream.get("bits_per_raw_sample"))
+    color_primaries = _normalize_color(video_stream.get("color_primaries"))
+    color_trc = _normalize_color(video_stream.get("color_trc") or video_stream.get("color_transfer"))
+    colorspace = _normalize_color(video_stream.get("colorspace") or video_stream.get("color_space"))
+    color_range = _normalize_color(video_stream.get("color_range"))
     if not color_range and pix_fmt and str(pix_fmt).startswith("yuvj"):
         # yuvj* is legacy full-range YUV (effectively yuv* + full range).
         color_range = "pc"
 
     duration = None
-    for raw in (stream.get("duration"), fmt.get("duration")):
+    for raw in (video_stream.get("duration"), fmt.get("duration")):
         if raw:
             try:
                 duration = float(raw)
@@ -146,10 +164,38 @@ def probe_video(path: Path) -> VideoInfo:
         except ValueError:
             bitrate = None
 
+    container_bitrate = None
+    if fmt.get("bit_rate"):
+        try:
+            bits = int(float(fmt.get("bit_rate")))
+            if bits > 0:
+                container_bitrate = f"{max(1, round(bits / 1000))}k"
+        except ValueError:
+            container_bitrate = None
+
+    file_size = None
+    if fmt.get("size"):
+        try:
+            file_size = int(float(fmt.get("size")))
+        except ValueError:
+            file_size = None
+
+    audio_bitrate = None
+    if audio_stream.get("bit_rate"):
+        try:
+            bits = int(float(audio_stream.get("bit_rate")))
+            if bits > 0:
+                audio_bitrate = f"{max(1, round(bits / 1000))}k"
+        except ValueError:
+            audio_bitrate = None
+
     return VideoInfo(
         width=width,
         height=height,
+        sar=video_stream.get("sample_aspect_ratio"),
+        dar=video_stream.get("display_aspect_ratio"),
         bitrate=bitrate,
+        container_bitrate=container_bitrate,
         fps=fps,
         avg_fps=avg_fps,
         r_fps=r_fps,
@@ -157,8 +203,24 @@ def probe_video(path: Path) -> VideoInfo:
         duration=duration,
         pix_fmt=pix_fmt,
         bit_depth=bit_depth,
+        codec_name=video_stream.get("codec_name"),
+        codec_long_name=video_stream.get("codec_long_name"),
+        profile=video_stream.get("profile"),
+        level=str(video_stream.get("level")) if video_stream.get("level") is not None else None,
         color_primaries=color_primaries,
         color_trc=color_trc,
         colorspace=colorspace,
         color_range=color_range,
+        format_name=fmt.get("format_name"),
+        format_long_name=fmt.get("format_long_name"),
+        file_size=file_size,
+        audio_codec=audio_stream.get("codec_name"),
+        audio_codec_long_name=audio_stream.get("codec_long_name"),
+        audio_channels=audio_stream.get("channels"),
+        audio_channel_layout=audio_stream.get("channel_layout"),
+        audio_sample_rate=int(audio_stream.get("sample_rate")) if audio_stream.get("sample_rate") else None,
+        audio_bitrate=audio_bitrate,
+        format_tags=fmt.get("tags"),
+        video_tags=video_stream.get("tags"),
+        audio_tags=audio_stream.get("tags"),
     )

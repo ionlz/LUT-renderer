@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import shutil
+import subprocess
 import sys
 import uuid
 from functools import partial
@@ -53,6 +55,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
     QGraphicsDropShadowEffect,
+    QDialog,
+    QSystemTrayIcon,
 )
 
 from .lut_manager import LutManagerDialog, MAX_LUT_HISTORY
@@ -168,6 +172,28 @@ class ThumbnailWorker(QRunnable):
             self.signals.failed.emit(self.task_id, str(exc))
 
 
+class InfoSignals(QObject):
+    ready = Signal(str, str, str)
+    failed = Signal(str, str, str)
+
+
+class InfoWorker(QRunnable):
+    def __init__(self, dialog_id: str, path: Path, title: str) -> None:
+        super().__init__()
+        self.dialog_id = dialog_id
+        self.path = path
+        self.title = title
+        self.signals = InfoSignals()
+
+    def run(self) -> None:
+        try:
+            info = probe_video(self.path)
+            text = MainWindow._format_video_info_text(self.path, info)
+            self.signals.ready.emit(self.dialog_id, self.title, text)
+        except Exception as exc:
+            self.signals.failed.emit(self.dialog_id, self.title, str(exc))
+
+
 class MainWindow(QMainWindow):
     LAYOUT_VERSION = 2
     def __init__(self) -> None:
@@ -175,6 +201,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("LUT Renderer")
         self.setWindowIcon(create_app_icon())
         self.resize(1100, 700)
+        self.setAcceptDrops(True)
 
         self.settings = load_settings()
         self._theme = self.settings.get("ui_theme", "light")
@@ -195,10 +222,16 @@ class MainWindow(QMainWindow):
         self.thumb_labels: Dict[str, QLabel] = {}
         self.thumb_size = QSize(160, 90)
         self.thumb_pool = QThreadPool()
+        self.info_pool = QThreadPool()
+        self._info_dialogs: Dict[str, QDialog] = {}
         self.help_popup = HelpPopup(self)
         self._help_hide_timer = QTimer(self)
         self._help_hide_timer.setSingleShot(True)
         self._help_hide_timer.timeout.connect(self._maybe_hide_help_popup)
+        self._tray_icon = QSystemTrayIcon(self)
+        self._tray_icon.setIcon(create_app_icon())
+        self._tray_icon.setToolTip(self._base_title)
+        self._tray_icon.show()
 
         self._build_ui()
         self._apply_theme()
@@ -212,6 +245,62 @@ class MainWindow(QMainWindow):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         self._init_taskbar_progress()
+
+    def dragEnterEvent(self, event) -> None:
+        if self._event_has_video_urls(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        if self._event_has_video_urls(event):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:
+        paths = self._paths_from_drop_event(event)
+        if paths:
+            self._add_paths(paths)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def _event_has_video_urls(self, event) -> bool:
+        mime = event.mimeData()
+        if not mime or not mime.hasUrls():
+            return False
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            path = Path(url.toLocalFile())
+            if path.is_dir() or path.suffix.lower() in VIDEO_EXTS:
+                return True
+        return False
+
+    def _paths_from_drop_event(self, event) -> List[Path]:
+        mime = event.mimeData()
+        if not mime or not mime.hasUrls():
+            return []
+        paths: List[Path] = []
+        seen = set()
+        for url in mime.urls():
+            if not url.isLocalFile():
+                continue
+            path = Path(url.toLocalFile())
+            if path.is_dir():
+                for item in path.rglob("*"):
+                    if item.suffix.lower() in VIDEO_EXTS:
+                        resolved = item.resolve()
+                        if resolved not in seen:
+                            seen.add(resolved)
+                            paths.append(item)
+            elif path.suffix.lower() in VIDEO_EXTS:
+                resolved = path.resolve()
+                if resolved not in seen:
+                    seen.add(resolved)
+                    paths.append(path)
+        return paths
 
     def _init_taskbar_progress(self) -> None:
         if self._taskbar_progress is not None:
@@ -283,6 +372,53 @@ class MainWindow(QMainWindow):
 
     def _on_queue_finished(self) -> None:
         self._update_system_progress()
+        self._notify_queue_finished()
+
+    def _notify_queue_finished(self) -> None:
+        tasks = list(self.task_manager.tasks.values())
+        total = len(tasks)
+        failed = sum(1 for t in tasks if t.status == TaskStatus.FAILED)
+        completed = sum(1 for t in tasks if t.status == TaskStatus.COMPLETED)
+        if total == 0:
+            return
+        if failed:
+            title = "任务完成（有失败）"
+            message = f"完成 {completed}/{total}，失败 {failed}。"
+        else:
+            title = "任务完成"
+            message = f"完成 {completed}/{total}。"
+        if self.isActiveWindow():
+            self.statusBar().showMessage(f"{title} {message}", 8000)
+            self._show_foreground_notice(title, message)
+            return
+        try:
+            if self._tray_icon.supportsMessages():
+                self._tray_icon.showMessage(title, message, QSystemTrayIcon.Information, 6000)
+                return
+        except Exception:
+            pass
+        self.statusBar().showMessage(f"{title} {message}", 8000)
+
+    def _show_foreground_notice(self, title: str, message: str) -> None:
+        dialog = QDialog(self, Qt.ToolTip | Qt.FramelessWindowHint)
+        dialog.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        dialog.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(12, 10, 12, 10)
+        title_label = QLabel(title)
+        title_label.setStyleSheet("font-weight: 600;")
+        body_label = QLabel(message)
+        body_label.setStyleSheet("color: #475569;")
+        layout.addWidget(title_label)
+        layout.addWidget(body_label)
+        dialog.adjustSize()
+        rect = self.rect()
+        global_top_right = self.mapToGlobal(rect.topRight())
+        x = global_top_right.x() - dialog.width() - 16
+        y = global_top_right.y() + 16
+        dialog.move(x, y)
+        dialog.show()
+        QTimer.singleShot(3000, dialog.close)
 
     def _maybe_hide_help_popup(self) -> None:
         if self.help_popup.isVisible() and self.help_popup.geometry().contains(QCursor.pos()):
@@ -332,14 +468,20 @@ class MainWindow(QMainWindow):
         self.task_table = QTableWidget(0, 7)
         self.task_table.setHorizontalHeaderLabels(["源", "缩略图", "文件", "状态", "进度", "输出", "结果"])
         header = self.task_table.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        header.setDefaultAlignment(Qt.AlignCenter)
+        header.setSectionResizeMode(0, QHeaderView.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.Fixed)
+        header.setSectionResizeMode(6, QHeaderView.Fixed)
         for col in range(2, 6):
             header.setSectionResizeMode(col, QHeaderView.Stretch)
+        self.task_table.setColumnWidth(0, 140)
+        self.task_table.setColumnWidth(1, self.thumb_size.width() + 24)
+        self.task_table.setColumnWidth(6, 140)
         self.task_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.task_table.setSelectionMode(QTableWidget.SingleSelection)
         self.task_table.setAlternatingRowColors(True)
+        self.task_table.setShowGrid(False)
+        self.task_table.verticalHeader().setVisible(False)
         self.task_table.setMinimumWidth(0)
         tasks_layout.addWidget(self.task_table)
 
@@ -419,13 +561,10 @@ class MainWindow(QMainWindow):
         # Logs/output panel (right bottom)
         logs_widget = QWidget()
         logs_layout = QVBoxLayout(logs_widget)
-        logs_header = QHBoxLayout()
-        logs_header.addStretch(1)
         self.log_clear_btn = QPushButton("清空")
         self.log_clear_btn.setCursor(Qt.PointingHandCursor)
         self.log_clear_btn.setProperty("variant", "secondary")
-        logs_header.addWidget(self.log_clear_btn)
-        logs_layout.addLayout(logs_header)
+        self.log_clear_btn.setProperty("compact", True)
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setPlaceholderText("输出日志...")
@@ -436,6 +575,14 @@ class MainWindow(QMainWindow):
         logs_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
         logs_dock.setAllowedAreas(Qt.AllDockWidgetAreas)
         logs_dock.setWidget(logs_widget)
+        logs_title = QWidget()
+        logs_title_layout = QHBoxLayout(logs_title)
+        logs_title_layout.setContentsMargins(8, 0, 8, 0)
+        logs_title_layout.setSpacing(8)
+        logs_title_layout.addWidget(QLabel("输出"))
+        logs_title_layout.addStretch(1)
+        logs_title_layout.addWidget(self.log_clear_btn)
+        logs_dock.setTitleBarWidget(logs_title)
 
         # Parameters panel (right top)
         params_widget = QWidget()
@@ -573,10 +720,20 @@ class MainWindow(QMainWindow):
         self.bit_depth_combo.addItem("保持 10bit", "preserve")
         self.bit_depth_combo.addItem("强制 8bit", "force_8bit")
         self.bit_depth_combo.addItem("自动", "auto")
+        self.bit_depth_combo.setCurrentIndex(2)
         self.bit_depth_combo.setToolTip("位深策略：尽量保持 10bit 或强制 8bit。")
         form.addRow(
             "位深策略",
             self._row_with_help(self.bit_depth_combo, "位深策略", help_texts["bit_depth_policy"]),
+        )
+
+        self.zscale_dither_combo = NoWheelComboBox()
+        self.zscale_dither_combo.addItem("关闭", "none")
+        self.zscale_dither_combo.addItem("误差扩散（更平滑）", "error_diffusion")
+        self.zscale_dither_combo.setToolTip("使用 zscale 的抖动算法，减少 8bit 输出的色带。")
+        form.addRow(
+            "抖动/去色带",
+            self._row_with_help(self.zscale_dither_combo, "抖动/去色带", help_texts["zscale_dither"]),
         )
 
         self.force_cfr_checkbox = QCheckBox("启用（强制 CFR）")
@@ -714,9 +871,8 @@ class MainWindow(QMainWindow):
         params_dock.setWidget(params_widget)
         self.addDockWidget(Qt.RightDockWidgetArea, params_dock)
         params_dock.setMinimumWidth(420)
-        self.addDockWidget(Qt.RightDockWidgetArea, logs_dock)
-        self.splitDockWidget(params_dock, logs_dock, Qt.Vertical)
-        self.resizeDocks([params_dock, logs_dock], [520, 200], Qt.Vertical)
+        self.addDockWidget(Qt.BottomDockWidgetArea, logs_dock)
+        self.resizeDocks([logs_dock], [220], Qt.Vertical)
 
         self.add_files_btn.clicked.connect(self._add_files)
         self.add_folder_btn.clicked.connect(self._add_folder)
@@ -793,6 +949,11 @@ class MainWindow(QMainWindow):
                 border-color: #cbd5e1;
                 color: #0f172a;
             }}
+            QPushButton[compact="true"] {{
+                padding: 1px 6px;
+                min-height: 18px;
+                font-size: 11px;
+            }}
             QPushButton[variant="warning"] {{
                 background: #f59e0b;
                 border-color: #d97706;
@@ -836,6 +997,45 @@ class MainWindow(QMainWindow):
                 border: none;
                 color: {help_text};
             }}
+            QTableWidget {{
+                border: none;
+                background: {table_bg};
+                alternate-background-color: {table_alt};
+                color: {table_text};
+                selection-background-color: {table_select};
+                selection-color: {table_text};
+            }}
+            QTableWidget::item {{
+                padding: 8px 10px;
+            }}
+            QTableWidget::item:focus {{
+                outline: none;
+            }}
+            QHeaderView::section {{
+                background: {table_header_bg};
+                color: {table_header_text};
+                border: none;
+                padding: 8px 10px;
+                font-weight: 600;
+            }}
+            QProgressBar {{
+                border: 1px solid {progress_border};
+                border-radius: 6px;
+                background: {progress_bg};
+                text-align: center;
+                height: 18px;
+                color: {progress_text};
+            }}
+            QProgressBar::chunk {{
+                background: {progress_fill};
+                border-radius: 6px;
+            }}
+            QToolButton {{
+                border: 1px solid {button_border};
+                border-radius: 10px;
+                padding: 4px 10px;
+                background: {button_bg};
+            }}
             """
         self.setStyleSheet(
             style.format(
@@ -845,6 +1045,18 @@ class MainWindow(QMainWindow):
                 help_bg=help_bg,
                 help_border=help_border,
                 help_text=help_text,
+                table_bg="#0b1220" if dark_mode else "#ffffff",
+                table_alt="#111827" if dark_mode else "#f8fafc",
+                table_text="#e5e7eb" if dark_mode else "#0f172a",
+                table_select="#1f2937" if dark_mode else "#e2e8f0",
+                table_header_bg="#111827" if dark_mode else "#f1f5f9",
+                table_header_text="#e2e8f0" if dark_mode else "#334155",
+                progress_border="#1f2937" if dark_mode else "#cbd5e1",
+                progress_bg="#0f172a" if dark_mode else "#ffffff",
+                progress_fill="#22c55e" if dark_mode else "#16a34a",
+                progress_text="#e5e7eb" if dark_mode else "#0f172a",
+                button_border="#1f2937" if dark_mode else "#cbd5e1",
+                button_bg="#0b1220" if dark_mode else "#ffffff",
             )
         )
 
@@ -911,10 +1123,11 @@ class MainWindow(QMainWindow):
             overwrite=True,
             generate_cover=self.cover_checkbox.isChecked(),
             processing_mode=self.processing_mode_combo.currentData() or "fast",
-            bit_depth_policy=self.bit_depth_combo.currentData() or "preserve",
+            bit_depth_policy=self.bit_depth_combo.currentData() or "auto",
             force_cfr=self.force_cfr_checkbox.isChecked(),
             inherit_color_metadata=self.inherit_color_checkbox.isChecked(),
             lut_interp=self.lut_interp_combo.currentData() or "tetrahedral",
+            zscale_dither=self.zscale_dither_combo.currentData() or "none",
             lut_input_matrix=self.lut_input_matrix_combo.currentData() or "auto",
             lut_output_tags=self.lut_output_tags_combo.currentData() or "bt709",
         )
@@ -1147,6 +1360,15 @@ class MainWindow(QMainWindow):
                 "• 10bit 更适合大面积渐变、天空、肤色等细腻过渡；8bit 在重压缩或强烈调色后更容易出现色带。\n\n"
                 "常见误区：\n"
                 "• 把 8bit 素材输出为 10bit 并不会“凭空增加细节”，它更多是为了在后续处理链中降低量化损失。"
+            ),
+            "zscale_dither": (
+                "抖动（Dither）用于在降低位深（尤其是 10bit→8bit）时，通过加入极轻微的噪声来打散量化误差，从而减少渐变色带。\n\n"
+                "选项说明：\n"
+                "• 关闭：不做抖动，速度更快，但在天空/皮肤等渐变区域更容易出现色带。\n"
+                "• 误差扩散（error_diffusion）：质量更好，色带更少，但会略微增加噪点与耗时。\n\n"
+                "建议：\n"
+                "• 输出 8bit 或你观察到明显色带时，建议开启。\n"
+                "• 输出 10bit 且链路保持 10bit 时，一般无需开启。"
             ),
             "force_cfr": (
                 "CFR（Constant Frame Rate，恒定帧率）与 VFR（Variable Frame Rate，可变帧率）是时间轴的两种组织方式。VFR 常见于手机/屏幕录制/部分相机模式，可能导致剪辑软件里出现“音画不同步/时间线漂移”。\n\n"
@@ -1600,7 +1822,8 @@ class MainWindow(QMainWindow):
         if not self._check_tools():
             return
         self._remember_lut(self._current_lut_text())
-        self._apply_lut_to_pending()
+        if not self._apply_current_settings_to_pending():
+            return
         pending_pro = [
             task
             for task in self.task_manager.tasks.values()
@@ -1694,11 +1917,15 @@ class MainWindow(QMainWindow):
         task.status = TaskStatus.PENDING
 
         # Refresh UI row.
-        self.task_table.setItem(row, 3, QTableWidgetItem(self._status_text(task.status)))
+        status_item = QTableWidgetItem(self._status_text(task.status))
+        status_item.setTextAlignment(Qt.AlignCenter)
+        self.task_table.setItem(row, 3, status_item)
         progress_widget = self.task_table.cellWidget(row, 4)
         if isinstance(progress_widget, QProgressBar):
             progress_widget.setValue(0)
-        self.task_table.setItem(row, 5, QTableWidgetItem(str(task.output_path)))
+        output_item = QTableWidgetItem(str(task.output_path))
+        output_item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.task_table.setItem(row, 5, output_item)
         self.task_manager.task_updated.emit(task_id)
         self._append_log(f"已重置任务并使用当前面板配置：{task.source_path.name}")
 
@@ -1749,6 +1976,25 @@ class MainWindow(QMainWindow):
             return
         self._open_file(task.output_path, title="打开结果视频")
 
+    def _show_task_info(self, task_id: str, kind: str) -> None:
+        task = self.task_manager.tasks.get(task_id)
+        if not task:
+            return
+        if kind == "output":
+            path = task.output_path
+            title = "输出视频详情"
+            if not path.exists():
+                QMessageBox.information(self, title, "输出文件不存在（请先执行任务）。")
+                return
+        else:
+            path = task.source_path
+            title = "源视频详情"
+        dialog_id, dialog, view = self._show_info_dialog(title, "正在读取详情…")
+        worker = InfoWorker(dialog_id, path, title)
+        worker.signals.ready.connect(self._on_info_ready)
+        worker.signals.failed.connect(self._on_info_failed)
+        self.info_pool.start(worker)
+
     def _open_file(self, path: Path, title: str) -> None:
         try:
             url = QUrl.fromLocalFile(str(path.resolve()))
@@ -1757,6 +2003,188 @@ class MainWindow(QMainWindow):
         if not QDesktopServices.openUrl(url):
             QMessageBox.warning(self, title, f"无法打开：{path}")
 
+    @staticmethod
+    def _format_video_info_text(path: Path, info) -> str:
+        lines = [f"文件：{path.name}"]
+        if info.format_long_name or info.format_name:
+            fmt_label = info.format_long_name or info.format_name
+            lines.append(f"封装：{fmt_label}")
+        if info.file_size:
+            lines.append(f"大小：{MainWindow._format_bytes(info.file_size)}")
+        else:
+            try:
+                size_bytes = path.stat().st_size
+                lines.append(f"大小：{MainWindow._format_bytes(size_bytes)}")
+            except Exception:
+                pass
+        if info.resolution:
+            lines.append(f"分辨率：{info.resolution}")
+        if info.sar and info.dar:
+            lines.append(f"像素比例：{info.sar}  显示比例：{info.dar}")
+        elif info.sar:
+            lines.append(f"像素比例：{info.sar}")
+        elif info.dar:
+            lines.append(f"显示比例：{info.dar}")
+        if info.codec_name or info.codec_long_name:
+            codec_label = info.codec_long_name or info.codec_name
+            profile = f" {info.profile}" if info.profile else ""
+            level = f" L{info.level}" if info.level else ""
+            lines.append(f"视频编码：{codec_label}{profile}{level}")
+        if info.fps:
+            fps_text = f"{info.fps:.3f}".rstrip("0").rstrip(".")
+            details = []
+            if info.avg_fps:
+                details.append(f"avg={info.avg_fps:.3f}".rstrip("0").rstrip("."))
+            if info.r_fps:
+                details.append(f"r={info.r_fps:.3f}".rstrip("0").rstrip("."))
+            suffix = f" ({', '.join(details)})" if details else ""
+            lines.append(f"帧率：{fps_text}{suffix}")
+        if info.duration:
+            lines.append(f"时长：{MainWindow._format_duration(info.duration)}")
+        if info.bitrate:
+            lines.append(f"视频码率：{info.bitrate}")
+        if info.container_bitrate:
+            lines.append(f"总码率：{info.container_bitrate}")
+        if info.pix_fmt:
+            lines.append(f"像素格式：{info.pix_fmt}")
+        if info.bit_depth:
+            lines.append(f"位深：{info.bit_depth}bit")
+        if info.is_vfr:
+            lines.append("可变帧率：是")
+        color_parts = []
+        if info.color_primaries:
+            color_parts.append(f"primaries={info.color_primaries}")
+        if info.color_trc:
+            color_parts.append(f"trc={info.color_trc}")
+        if info.colorspace:
+            color_parts.append(f"colorspace={info.colorspace}")
+        if info.color_range:
+            color_parts.append(f"range={info.color_range}")
+        if color_parts:
+            lines.append("色彩： " + ", ".join(color_parts))
+        if info.audio_codec or info.audio_codec_long_name:
+            audio_label = info.audio_codec_long_name or info.audio_codec
+            audio_parts = [f"编码：{audio_label}"]
+            if info.audio_channels:
+                audio_parts.append(f"声道：{info.audio_channels}")
+            if info.audio_channel_layout:
+                audio_parts.append(f"布局：{info.audio_channel_layout}")
+            if info.audio_sample_rate:
+                audio_parts.append(f"采样率：{info.audio_sample_rate}Hz")
+            if info.audio_bitrate:
+                audio_parts.append(f"码率：{info.audio_bitrate}")
+            lines.append("音频： " + "  ".join(audio_parts))
+        tag_lines = MainWindow._format_exif_tags(path, info)
+        if tag_lines:
+            lines.append("")
+            lines.append("元数据/EXIF：")
+            lines.extend(tag_lines)
+        return "\n".join(lines)
+
+    def _show_info_dialog(self, title: str, text: str) -> tuple[str, QDialog, QPlainTextEdit]:
+        dialog_id = str(uuid.uuid4())
+        dialog = QDialog(self)
+        dialog.setWindowTitle(title)
+        dialog.resize(720, 520)
+        layout = QVBoxLayout(dialog)
+        view = QPlainTextEdit()
+        view.setReadOnly(True)
+        view.setPlainText(text)
+        layout.addWidget(view)
+        close_btn = QPushButton("关闭")
+        close_btn.setProperty("variant", "secondary")
+        close_btn.clicked.connect(dialog.accept)
+        layout.addWidget(close_btn, alignment=Qt.AlignRight)
+        self._info_dialogs[dialog_id] = dialog
+        dialog.finished.connect(lambda _=None, did=dialog_id: self._info_dialogs.pop(did, None))
+        dialog.show()
+        return dialog_id, dialog, view
+
+    def _on_info_ready(self, dialog_id: str, title: str, text: str) -> None:
+        dialog = self._info_dialogs.get(dialog_id)
+        if not dialog:
+            return
+        view = dialog.findChild(QPlainTextEdit)
+        if view:
+            view.setPlainText(text)
+        dialog.setWindowTitle(title)
+
+    def _on_info_failed(self, dialog_id: str, title: str, message: str) -> None:
+        dialog = self._info_dialogs.get(dialog_id)
+        if not dialog:
+            return
+        view = dialog.findChild(QPlainTextEdit)
+        if view:
+            view.setPlainText(f"无法读取视频信息：{message}")
+        dialog.setWindowTitle(title)
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        if seconds < 0:
+            return "未知"
+        total = int(seconds)
+        ms = int(round((seconds - total) * 1000))
+        hours = total // 3600
+        minutes = (total % 3600) // 60
+        secs = total % 60
+        if hours:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}.{ms:03d}"
+        return f"{minutes:02d}:{secs:02d}.{ms:03d}"
+
+    @staticmethod
+    def _format_exif_tags(path: Path, info) -> List[str]:
+        lines: List[str] = []
+        ffprobe_tags = MainWindow._merge_ffprobe_tags(info)
+        if ffprobe_tags:
+            lines.append("FFprobe 标签：")
+            for key in sorted(ffprobe_tags.keys()):
+                value = ffprobe_tags.get(key)
+                if value:
+                    lines.append(f"{key}：{value}")
+        exif = MainWindow._read_exiftool_tags(path)
+        if exif:
+            if lines:
+                lines.append("")
+            lines.append("EXIFTool：")
+            for key in sorted(exif.keys()):
+                value = exif.get(key)
+                if value:
+                    lines.append(f"{key}：{value}")
+        elif shutil.which("exiftool") is None:
+            if lines:
+                lines.append("")
+            lines.append("EXIFTool：未安装（可选）")
+        return lines
+
+    @staticmethod
+    def _merge_ffprobe_tags(info) -> dict:
+        merged = {}
+        for tags in (info.format_tags, info.video_tags, info.audio_tags):
+            if tags:
+                merged.update(tags)
+        return merged
+
+    @staticmethod
+    def _read_exiftool_tags(path: Path) -> dict:
+        if shutil.which("exiftool") is None:
+            return {}
+        cmd = ["exiftool", "-json", str(path)]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        except Exception:
+            return {}
+        try:
+            payload = json.loads(result.stdout or "[]")
+        except json.JSONDecodeError:
+            return {}
+        if not payload:
+            return {}
+        data = payload[0] if isinstance(payload, list) else payload
+        if not isinstance(data, dict):
+            return {}
+        data.pop("SourceFile", None)
+        return data
+
     def _on_task_added(self, task_id: str) -> None:
         task = self.task_manager.tasks.get(task_id)
         if not task:
@@ -1764,41 +2192,82 @@ class MainWindow(QMainWindow):
         row = self.task_table.rowCount()
         self.task_table.insertRow(row)
         self.task_rows[task_id] = row
-        self.task_table.setRowHeight(row, self.thumb_size.height() + 8)
+        self.task_table.setRowHeight(row, self.thumb_size.height() + 16)
 
         source_btn = QToolButton()
         source_btn.setText("源")
         source_btn.setToolTip("打开原视频")
+        source_btn.setMinimumWidth(44)
         source_btn.setCursor(Qt.PointingHandCursor)
         source_btn.clicked.connect(partial(self._open_source, task_id))
-        self.task_table.setCellWidget(row, 0, source_btn)
+        source_info_btn = QToolButton()
+        source_info_btn.setText("详情")
+        source_info_btn.setToolTip("查看源视频详情")
+        source_info_btn.setMinimumWidth(44)
+        source_info_btn.setCursor(Qt.PointingHandCursor)
+        source_info_btn.clicked.connect(partial(self._show_task_info, task_id, "source"))
+        source_cell = QWidget()
+        source_layout = QHBoxLayout(source_cell)
+        source_layout.setContentsMargins(2, 0, 2, 0)
+        source_layout.setSpacing(6)
+        source_layout.addWidget(source_btn)
+        source_layout.addWidget(source_info_btn)
+        source_layout.setAlignment(Qt.AlignCenter)
+        self.task_table.setCellWidget(row, 0, source_cell)
 
         thumb_label = QLabel()
         thumb_label.setFixedSize(self.thumb_size)
         thumb_label.setAlignment(Qt.AlignCenter)
         thumb_label.setText("...")
-        self.task_table.setCellWidget(row, 1, thumb_label)
+        thumb_cell = QWidget()
+        thumb_layout = QHBoxLayout(thumb_cell)
+        thumb_layout.setContentsMargins(2, 2, 2, 2)
+        thumb_layout.addStretch(1)
+        thumb_layout.addWidget(thumb_label)
+        thumb_layout.addStretch(1)
+        self.task_table.setCellWidget(row, 1, thumb_cell)
         self.thumb_labels[task_id] = thumb_label
         self._enqueue_thumbnail(task_id, task.source_path)
 
         name_item = QTableWidgetItem(task.display_name())
         name_item.setData(Qt.UserRole, task_id)
+        name_item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
         self.task_table.setItem(row, 2, name_item)
-        self.task_table.setItem(row, 3, QTableWidgetItem(self._status_text(task.status)))
+        status_item = QTableWidgetItem(self._status_text(task.status))
+        status_item.setTextAlignment(Qt.AlignCenter)
+        self.task_table.setItem(row, 3, status_item)
 
         progress = QProgressBar()
         progress.setValue(task.progress)
         progress.setAlignment(Qt.AlignCenter)
+        progress.setTextVisible(True)
+        progress.setFormat("%p%")
         self.task_table.setCellWidget(row, 4, progress)
 
-        self.task_table.setItem(row, 5, QTableWidgetItem(str(task.output_path)))
+        output_item = QTableWidgetItem(str(task.output_path))
+        output_item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self.task_table.setItem(row, 5, output_item)
 
         output_btn = QToolButton()
         output_btn.setText("结果")
         output_btn.setToolTip("打开结果视频")
+        output_btn.setMinimumWidth(44)
         output_btn.setCursor(Qt.PointingHandCursor)
         output_btn.clicked.connect(partial(self._open_output, task_id))
-        self.task_table.setCellWidget(row, 6, output_btn)
+        output_info_btn = QToolButton()
+        output_info_btn.setText("详情")
+        output_info_btn.setToolTip("查看输出视频详情")
+        output_info_btn.setMinimumWidth(44)
+        output_info_btn.setCursor(Qt.PointingHandCursor)
+        output_info_btn.clicked.connect(partial(self._show_task_info, task_id, "output"))
+        output_cell = QWidget()
+        output_layout = QHBoxLayout(output_cell)
+        output_layout.setContentsMargins(2, 0, 2, 0)
+        output_layout.setSpacing(6)
+        output_layout.addWidget(output_btn)
+        output_layout.addWidget(output_info_btn)
+        output_layout.setAlignment(Qt.AlignCenter)
+        self.task_table.setCellWidget(row, 6, output_cell)
         self._update_system_progress()
 
     def _on_task_updated(self, task_id: str) -> None:
@@ -1926,6 +2395,9 @@ class MainWindow(QMainWindow):
         depth_index = self.bit_depth_combo.findData(params.bit_depth_policy)
         if depth_index >= 0:
             self.bit_depth_combo.setCurrentIndex(depth_index)
+        dither_index = self.zscale_dither_combo.findData(getattr(params, "zscale_dither", "none"))
+        if dither_index >= 0:
+            self.zscale_dither_combo.setCurrentIndex(dither_index)
 
     def _save_preset(self) -> None:
         name, ok = QInputDialog.getText(self, "保存预设", "预设名称")
@@ -2081,6 +2553,63 @@ class MainWindow(QMainWindow):
             self._append_log(
                 f"提示: {codec_fixed} 个任务原为视频 copy，启用 LUT 后已自动切换为 {replacement_codec}"
             )
+
+    def _apply_current_settings_to_pending(self) -> bool:
+        params = self._current_params()
+        lut_text = self._current_lut_text()
+        lut_path = Path(lut_text) if lut_text else None
+        if lut_path and not lut_path.exists():
+            QMessageBox.warning(self, "LUT", f"LUT 文件不存在：{lut_path}")
+            return False
+
+        updated = 0
+        codec_fixed = 0
+        replacement_codec = self.video_codec_combo.currentText()
+        if replacement_codec == "copy":
+            replacement_codec = self._preferred_fast_codec()
+
+        for task in self.task_manager.tasks.values():
+            if task.status != TaskStatus.PENDING:
+                continue
+            output_dir = self._resolve_output_dir(task.source_path)
+            task_params = ProcessingParams(**params.to_dict())
+            if task_params.video_codec != "copy" and task.source_info:
+                if not task_params.resolution and task.source_info.resolution:
+                    task_params.resolution = task.source_info.resolution
+                if not task_params.bitrate and task.source_info.bitrate:
+                    task_params.bitrate = task.source_info.bitrate
+            if lut_path and task_params.video_codec == "copy":
+                task_params.video_codec = replacement_codec
+                codec_fixed += 1
+            task.params = task_params
+            task.lut_path = lut_path
+            task.output_path = self._build_output_path(task.source_path, output_dir)
+            task.cover_path = (
+                self._build_cover_path(task.source_path, output_dir)
+                if task_params.generate_cover
+                else None
+            )
+            if task_params.processing_mode == "pro" and self._intermediate_dir:
+                task.intermediate_path = self._build_intermediate_path(task.source_path, output_dir)
+            elif task_params.processing_mode == "pro":
+                task.intermediate_path = None
+            else:
+                task.intermediate_path = None
+            row = self.task_rows.get(task.task_id)
+            if row is not None:
+                output_item = QTableWidgetItem(str(task.output_path))
+                output_item.setTextAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+                self.task_table.setItem(row, 5, output_item)
+            self.task_manager.task_updated.emit(task.task_id)
+            updated += 1
+
+        if updated:
+            self._append_log(f"已将当前右侧设置应用到 {updated} 个待处理任务")
+        if codec_fixed:
+            self._append_log(
+                f"提示: {codec_fixed} 个任务原为视频 copy，启用 LUT 后已自动切换为 {replacement_codec}"
+            )
+        return True
 
     def _enqueue_thumbnail(self, task_id: str, source: Path) -> None:
         worker = ThumbnailWorker(task_id, source, self.thumb_size)

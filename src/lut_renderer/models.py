@@ -43,6 +43,7 @@ class ProcessingParams:
     force_cfr: bool = True
     inherit_color_metadata: bool = True
     lut_interp: str = "tetrahedral"
+    zscale_dither: str = "none"
     # LUT input interpretation for YUV<->RGB matrix selection (not a full color-managed pipeline).
     # - "auto": use ffprobe colorspace when available; otherwise let FFmpeg decide
     # - "bt709": force bt709 matrix for YUV->RGB conversion before lut3d
@@ -80,6 +81,7 @@ class ProcessingParams:
             "force_cfr": self.force_cfr,
             "inherit_color_metadata": self.inherit_color_metadata,
             "lut_interp": self.lut_interp,
+            "zscale_dither": self.zscale_dither,
             "lut_input_matrix": self.lut_input_matrix,
             "lut_output_tags": self.lut_output_tags,
         }
@@ -114,6 +116,7 @@ class ProcessingParams:
                 data.get("inherit_color_metadata", defaults.inherit_color_metadata)
             ),
             lut_interp=data.get("lut_interp", defaults.lut_interp),
+            zscale_dither=data.get("zscale_dither", defaults.zscale_dither),
             lut_input_matrix=data.get("lut_input_matrix", defaults.lut_input_matrix),
             lut_output_tags=data.get("lut_output_tags", defaults.lut_output_tags),
         )

@@ -302,6 +302,9 @@ def build_command(
                     notes.append("位深策略=保持10bit: 编码器不支持10bit，回退 yuv420p")
 
         if pix_fmt:
+            if getattr(params, "zscale_dither", "none") == "error_diffusion":
+                filters.append("zscale=dither=error_diffusion")
+                notes.append("抖动: zscale=dither=error_diffusion")
             if lut_path:
                 filters.append(f"format={pix_fmt}")
             cmd.extend(["-pix_fmt", pix_fmt])
